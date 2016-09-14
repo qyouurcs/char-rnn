@@ -158,4 +158,3 @@ for i=1, opt.length do
     io.write(ivocab[prev_char[1]])
 end
 io.write('\n') io.flush()
-
