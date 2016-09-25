@@ -18,6 +18,7 @@ require 'nn'
 require 'nngraph'
 require 'optim'
 require 'lfs'
+require 'hdf5'
 
 require 'util.OneHot'
 require 'util.misc'
@@ -26,6 +27,9 @@ local model_utils = require 'util.model_utils'
 local LSTM = require 'model.LSTM'
 local GRU = require 'model.GRU'
 local RNN = require 'model.RNN'
+local build_vocab = require 'build_vocab'
+printf = utils.printf
+debugger = require 'fb.debugger'
 
 cmd = torch.CmdLine()
 cmd:text()
@@ -33,7 +37,7 @@ cmd:text('Train a character-level language model')
 cmd:text()
 cmd:text('Options')
 -- data
-cmd:option('-data_dir','data/tinyshakespeare','data directory. Should contain the file input.txt with input data')
+cmd:option('-data_dir','data/coco_inception','data directory. Should contain the file input.txt with input data')
 -- model params
 cmd:option('-rnn_size', 128, 'size of LSTM internal state')
 cmd:option('-num_layers', 2, 'number of layers in the LSTM')
@@ -61,7 +65,11 @@ cmd:option('-savefile','lstm','filename to autosave the checkpont to. Will be in
 cmd:option('-accurate_gpu_timing',0,'set this flag to 1 to get precise timings when using GPU. Might make code bit slower but reports accurate timings.')
 -- GPU/CPU
 cmd:option('-gpuid',0,'which gpu to use. -1 = use CPU')
-cmd:option('-opencl',0,'use OpenCL (instead of CUDA)')
+
+cmd:option('-train_dir','./data/coco_inception/fea_dir_split/fea_dir_train/', 'directory for the training data.')
+cmd:option('-val_dir','./data/coco_inception/fea_dir_split/fea_dir_val/', 'directory for the validating data.')
+cmd:option('-fea_len', 1024, 'feature length.')
+
 cmd:text()
 
 -- parse input params
@@ -89,23 +97,39 @@ if opt.gpuid >= 0 and opt.opencl == 0 then
     end
 end
 
--- initialize clnn/cltorch for training on the GPU and fall back to CPU gracefully
-if opt.gpuid >= 0 and opt.opencl == 1 then
-    local ok, cunn = pcall(require, 'clnn')
-    local ok2, cutorch = pcall(require, 'cltorch')
-    if not ok then print('package clnn not found!') end
-    if not ok2 then print('package cltorch not found!') end
-    if ok and ok2 then
-        print('using OpenCL on GPU ' .. opt.gpuid .. '...')
-        cltorch.setDevice(opt.gpuid + 1) -- note +1 to make it 0 indexed! sigh lua
-        torch.manualSeed(opt.seed)
-    else
-        print('If cltorch and clnn are installed, your OpenCL driver may be improperly configured.')
-        print('Check your OpenCL driver installation, check output of clinfo command, and try again.')
-        print('Falling back on CPU mode')
-        opt.gpuid = -1 -- overwrite user setting
-    end
+-- Now, we need to build the vocab_file
+train_fea_fn = path.join(opt.data_dir, 'train_fea.t7')
+train_fns_fn = path.join(opt.data_dir, 'train_fns.t7')
+val_fea_fn = path.join(opt.data_dir, 'val_fea.t7')
+val_fns_fn = path.join(opt.data_dir, 'val_fns.t7')
+
+train_fea = nil
+train_fns = nil
+val_fea = nil
+val_fns = nil
+
+if path.isfile(train_fea_fn) and path.isfile(val_fea_fn) then
+    train_fea = torch.load(train_fea_fn)
+    train_fns = torch.load(train_fns_fn)
+    val_fea = torch.load(val_fea_fn)
+    val_fns = torch.load(val_fns_fn)
+else
+    data_loader = require 'data_loader'
+    train_fea, train_fns = data_loader.load_dir(opt.train_dir, opt.fea_len)
+    val_fea, val_fns = data_loader.load_dir(opt.val_dir, opt.fea_len)
+    torch.save(train_fea_fn, train_fea)
+    torch.save(train_fns_fn, train_fns)
+    torch.save(val_fea_fn, val_fea)
+    torch.save(val_fns_fn, val_fns)
 end
+
+-- Now, we build the vocab.
+local vocab_fn = path.join(opt.data_dir, 'vocab_chars.t7')
+local ds, v2i, i2v
+
+local ds_cap_fn = path.join(opt.data_dir, 'dataset.t7')
+ds,v2i,i2v =  build_vocab.build_vocab(ds_cap_fn, vocab_fn)
+-- Now, we need to learn those parameters.
 
 -- create the data loader class
 local loader = CharSplitLMMinibatchLoader.create(opt.data_dir, opt.batch_size, opt.seq_length, split_sizes)

@@ -135,6 +135,50 @@ function build_vocab:next_batch(split_index)
 end
 
 -- *** STATIC method ***
+function build_vocab.build_vocab(in_fn, out_vocabfile)
+    local ds = torch.load(in_fn)
+    if path.isfile(out_vocabfile) then
+        printf('loading vocab from %s', out_vocabfile)
+        local i2v = {}
+        local v2i = torch.load(out_vocabfile)
+        for v,i in pairs(v2i) do
+            i2v[i] = v
+        end
+        return ds, v2i, i2v
+    end
+    local timer = torch.Timer()
+    local cnt = 0
+    printf('loading json dataset %s', in_fn) 
+    local ds = torch.load(in_fn)
+    local tot_len = 0
+
+    print('creating vocabulary mapping...')
+    local unordered = {}
+    for img, val in pairs(ds) do
+        -- Now, we load each image .
+        local img_meta = val
+        local raw_txt = img_meta['caps']['raw']
+        for cid, txt in pairs(raw_txt) do
+            local str = raw_txt[cid]
+            local str_lower = string.lower(str)
+            for char in str_lower:gmatch'.' do
+                if not unordered[char] then unordered[char] = true end
+                tot_len = tot_len + 1
+            end
+        end
+    end
+    local ordered = {}
+    for char in pairs(unordered) do ordered[#ordered + 1] = char end
+    table.sort(ordered)
+    local vocab_mapping = {}
+    for i, char in ipairs(ordered) do
+        vocab_mapping[char] = i
+    end
+    printf('Saving the vocabulary to %s', out_vocabfile)
+    torch.save(out_vocabfile, vocab_mapping)
+    return ds, vocab_mapping, ordered
+end
+-- *** STATIC method ***
 function build_vocab.text_to_tensor(in_textdir, out_vocabfile, out_tensorfile)
     local timer = torch.Timer()
     local cnt = 0
