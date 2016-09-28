@@ -58,7 +58,7 @@ cmd:option('-cnn_weight_decay', 0, 'L2 weight decay just for the CNN')
 -- Evaluation/Checkpointing
 cmd:option('-val_images_use', 3200, 'how many images to use when periodically evaluating the validation loss? (-1 = all)')
 cmd:option('-save_checkpoint_every', 2500, 'how often to save a model checkpoint?')
-cmd:option('-checkpoint_path', './cv_emb', 'folder to save checkpoints into (empty = this folder)')
+cmd:option('-checkpoint_path', './cv', 'folder to save checkpoints into (empty = this folder)')
 cmd:option('-language_eval', 0, 'Evaluate language as well (1 = yes, 0 = no)? BLEU/CIDEr/METEOR/ROUGE_L? requires coco-caption code from Github.')
 cmd:option('-losses_log_every', 25, 'How often do we snapshot losses, for inclusion in the progress dump? (0 = disable)')
 
@@ -107,7 +107,6 @@ if string.len(opt.start_from) > 0 then
   local loaded_checkpoint = torch.load(opt.start_from)
   protos = loaded_checkpoint.protos
   net_utils.unsanitize_gradients(protos.cnn)
-  net_utils.unsanitize_gradients(protos.cnn_emb)
   local lm_modules = protos.lm:getModulesList()
   for k,v in pairs(lm_modules) do net_utils.unsanitize_gradients(v) end
   protos.crit = nn.LanguageModelCriterion() -- not in checkpoints, create manually
@@ -129,7 +128,7 @@ else
   local cnn_backend = opt.backend
   if opt.gpuid == -1 then cnn_backend = 'nn' end -- override to nn if gpu is disabled
   local cnn_raw = loadcaffe.load(opt.cnn_proto, opt.cnn_model, cnn_backend)
-  protos.cnn, protos.cnn_emb = net_utils.build_cnn2(cnn_raw, {encoding_size = opt.input_encoding_size, backend = cnn_backend})
+  protos.cnn = net_utils.build_cnn(cnn_raw, {encoding_size = opt.input_encoding_size, backend = cnn_backend})
   -- initialize a special FeatExpander module that "corrects" for the batch number discrepancy 
   -- where we have multiple captions per one image in a batch. This is done for efficiency
   -- because doing a CNN forward pass is expensive. We expand out the CNN features for each sentence
@@ -147,14 +146,10 @@ end
 -- Keep CNN params separate in case we want to try to get fancy with different optims on LM/CNN
 local params, grad_params = protos.lm:getParameters()
 local cnn_params, cnn_grad_params = protos.cnn:getParameters()
-local cnn_emb_params, cnn_emb_grad_params = protos.cnn_emb:getParameters()
-
 print('total number of parameters in LM: ', params:nElement())
 print('total number of parameters in CNN: ', cnn_params:nElement())
-print('total number of parameters in CNN Emb: ', cnn_emb_params:nElement())
 assert(params:nElement() == grad_params:nElement())
 assert(cnn_params:nElement() == cnn_grad_params:nElement())
-assert(cnn_emb_params:nElement() == cnn_emb_grad_params:nElement())
 
 -- construct thin module clones that share parameters with the actual
 -- modules. These thin module will have no intermediates and will be used
@@ -163,7 +158,6 @@ local thin_lm = protos.lm:clone()
 thin_lm.core:share(protos.lm.core, 'weight', 'bias') -- TODO: we are assuming that LM has specific members! figure out clean way to get rid of, not modular.
 thin_lm.lookup_table:share(protos.lm.lookup_table, 'weight', 'bias')
 local thin_cnn = protos.cnn:clone('weight', 'bias')
-local thin_cnn_emb = protos.cnn_emb:clone('weight', 'bias')
 -- sanitize all modules of gradient storage so that we dont save big checkpoints
 net_utils.sanitize_gradients(thin_cnn)
 local lm_modules = thin_lm:getModulesList()
@@ -183,7 +177,6 @@ local function eval_split(split, evalopt)
   local val_images_use = utils.getopt(evalopt, 'val_images_use', true)
 
   protos.cnn:evaluate()
-  protos.cnn_emb:evaluate()
   protos.lm:evaluate()
   loader:resetIterator(split) -- rewind iteator back to first datapoint in the split
   local n = 0
@@ -200,15 +193,14 @@ local function eval_split(split, evalopt)
 
     -- forward the model to get loss
     local feats = protos.cnn:forward(data.images)
-    local feats_emb = protos.cnn_emb:forward(feats)
-    local expanded_feats = protos.expander:forward(feats_emb)
+    local expanded_feats = protos.expander:forward(feats)
     local logprobs = protos.lm:forward{expanded_feats, data.labels}
     local loss = protos.crit:forward(logprobs, data.labels)
     loss_sum = loss_sum + loss
     loss_evals = loss_evals + 1
 
     -- forward the model to also get generated samples for each image
-    local seq = protos.lm:sample(feats_emb)
+    local seq = protos.lm:sample(feats)
     local sents = net_utils.decode_sequence_char(vocab, seq)
     for k=1,#sents do
       local entry = {image_id = data.infos[k].id, caption = sents[k]}
@@ -244,11 +236,8 @@ end
 local iter = 0
 local function lossFun()
   protos.cnn:training()
-  protos.cnn_emb:training()
   protos.lm:training()
   grad_params:zero()
-  cnn_emb_grad_params:zero()
-
   if opt.finetune_cnn_after >= 0 and iter >= opt.finetune_cnn_after then
     cnn_grad_params:zero()
   end
@@ -261,11 +250,11 @@ local function lossFun()
   data.images = net_utils.prepro(data.images, true, opt.gpuid >= 0) -- preprocess in place, do data augmentation
   -- data.images: Nx3x224x224 
   -- data.seq: LxM where L is sequence length upper bound, and M = N*seq_per_img
+
   -- forward the ConvNet on images (most work happens here)
   local feats = protos.cnn:forward(data.images)
-  local feats_emb= protos.cnn_emb:forward(feats)
   -- we have to expand out image features, once for each sentence
-  local expanded_feats = protos.expander:forward(feats_emb)
+  local expanded_feats = protos.expander:forward(feats)
   -- forward the language model
   local logprobs = protos.lm:forward{expanded_feats, data.labels}
   -- forward the language model criterion
@@ -278,20 +267,15 @@ local function lossFun()
   local dlogprobs = protos.crit:backward(logprobs, data.labels)
   -- backprop language model
   local dexpanded_feats, ddummy = unpack(protos.lm:backward({expanded_feats, data.labels}, dlogprobs))
-  local dfeats = protos.expander:backward(feats_emb, dexpanded_feats)
-  local demb = protos.cnn_emb:backward(feats, dfeats)
   -- backprop the CNN, but only if we are finetuning
   if opt.finetune_cnn_after >= 0 and iter >= opt.finetune_cnn_after then
-    local dx = protos.cnn:backward(data.images, demb)
+    local dfeats = protos.expander:backward(feats, dexpanded_feats)
+    local dx = protos.cnn:backward(data.images, dfeats)
   end
 
   -- clip gradients
   -- print(string.format('claming %f%% of gradients', 100*torch.mean(torch.gt(torch.abs(grad_params), opt.grad_clip))))
   grad_params:clamp(-opt.grad_clip, opt.grad_clip)
-  -- Not sure about the following line, just add it in order to be the same with the cnn features.
-  -- or just commented it to make it the same with the remaining net.
-  --cnn_emb_grad_params:add(opt.cnn_weight_decay, cnn_emb_params)
-  cnn_emb_grad_params:clamp(-opt.grad_clip, opt.grad_clip)
 
   -- apply L2 regularization
   if opt.cnn_weight_decay > 0 then
@@ -311,7 +295,6 @@ end
 -------------------------------------------------------------------------------
 local loss0
 local optim_state = {}
-local cnn_emb_optim_state = {}
 local cnn_optim_state = {}
 local loss_history = {}
 local val_lang_stats_history = {}
@@ -325,7 +308,6 @@ while true do
   print(string.format('iter %d: %f', iter, losses.total_loss))
 
   -- save checkpoint once in a while (or on final iteration)
-  --if (iter > 0 and (iter % opt.save_checkpoint_every == 0 or iter == opt.max_iters)) then
   if (iter % opt.save_checkpoint_every == 0 or iter == opt.max_iters) then
 
     -- evaluate the validation performance
@@ -367,7 +349,6 @@ while true do
         local save_protos = {}
         save_protos.lm = thin_lm -- these are shared clones, and point to correct param storage
         save_protos.cnn = thin_cnn
-        save_protos.cnn_emb = thin_cnn_emb
         checkpoint.protos = save_protos
         -- also include the vocabulary mapping so that we can use the checkpoint 
         -- alone to run on arbitrary images without the data loader
@@ -391,22 +372,16 @@ while true do
   -- perform a parameter update
   if opt.optim == 'rmsprop' then
     rmsprop(params, grad_params, learning_rate, opt.optim_alpha, opt.optim_epsilon, optim_state)
-    rmsprop(cnn_emb_params, cnn_emb_grad_params, learning_rate, opt.optim_alpha, opt.optim_epsilon, cnn_emb_optim_state)
   elseif opt.optim == 'adagrad' then
     adagrad(params, grad_params, learning_rate, opt.optim_epsilon, optim_state)
-    adagrad(cnn_emb_params, cnn_emb_grad_params, learning_rate, opt.optim_epsilon, cnn_emb_optim_state)
   elseif opt.optim == 'sgd' then
     sgd(params, grad_params, opt.learning_rate)
-    sgd(cnn_emb_params, cnn_emb_grad_params, opt.learning_rate)
   elseif opt.optim == 'sgdm' then
     sgdm(params, grad_params, learning_rate, opt.optim_alpha, optim_state)
-    sgdm(cnn_emb_params, cnn_emb_grad_params, learning_rate, opt.optim_alpha, cnn_emb_optim_state)
   elseif opt.optim == 'sgdmom' then
     sgdmom(params, grad_params, learning_rate, opt.optim_alpha, optim_state)
-    sgdmom(cnn_emb_params, cnn_emb_grad_params, learning_rate, opt.optim_alpha, cnn_emb_optim_state)
   elseif opt.optim == 'adam' then
     adam(params, grad_params, learning_rate, opt.optim_alpha, opt.optim_beta, opt.optim_epsilon, optim_state)
-    adam(cnn_emb_params, cnn_emb_grad_params, learning_rate, opt.optim_alpha, opt.optim_beta, opt.optim_epsilon, cnn_emb_optim_state)
   else
     error('bad option opt.optim')
   end
